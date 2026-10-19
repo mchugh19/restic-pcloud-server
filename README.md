@@ -117,6 +117,19 @@ rest, which is what the periodic check is for.
 
 ## 3. Troubleshooting
 
+At startup the server performs one real verified write of a small probe object against the
+remote root and logs the result as a `PROBE` line: the hash algorithm verification will use and
+the full set of hashes the remote reports for the object (sha256 in pCloud's EU region, sha1/md5
+in the US). If verification cannot work (for example the remote reports no hashes while
+`-require-hash=true`), the probe logs that as a warning instead of leaving it to the first
+backup to discover; the probe object is deleted again immediately and the server starts either
+way.
+
+Routine successful saves are not logged individually - at repository scale that is one line per
+object for no signal. What is logged: any save that needed a retry (including its eventual
+verified OK), every verification mismatch or failure, successful deletes, and failed
+authentication attempts.
+
 Run with `-debug=true` (or `DEBUG=true` in `.env`) to log per-request timing, concurrency, and
 every verify/retry decision to stdout:
 

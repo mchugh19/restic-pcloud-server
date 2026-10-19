@@ -23,6 +23,7 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -531,7 +532,9 @@ func handleSave(w http.ResponseWriter, r *http.Request, repo, kind, name string)
 			if algo == "size-only" {
 				logf("SAVE %s [req %05d] %s: WARNING verified by size only - pCloud reported no content hash for this object", path, reqID, label)
 			}
-			logf("SAVE %s [req %05d] %s: %sverified OK%s (%d bytes, verified by %s, total %s)", path, reqID, label, colorGreen, colorReset, written, algo, time.Since(saveStart).Round(time.Second))
+			if attempt > 0 {
+				logf("SAVE %s [req %05d] %s: %sverified OK%s (%d bytes, verified by %s, total %s)", path, reqID, label, colorGreen, colorReset, written, algo, time.Since(saveStart).Round(time.Second))
+			}
 			w.WriteHeader(http.StatusOK)
 			return
 		}
@@ -563,6 +566,66 @@ func handleDelete(w http.ResponseWriter, repo, kind, name string) {
 	w.WriteHeader(http.StatusOK)
 }
 
+// startupProbe performs one real verified write against the remote root at
+// startup and logs the outcome, so the log states up front which content hash
+// verification will use (pCloud reports sha256 in the EU region, sha1 or md5
+// in the US) and whether verified writes work at all. It reuses the same
+// copyto + verify path as a real save. It never fails startup: a remote that
+// is briefly unreachable at boot must not crash-loop the service, and restic
+// surfaces real errors at backup time regardless. The probe object is deleted
+// again immediately.
+func startupProbe() {
+	probePath := fmt.Sprintf("%s/.restic-pcloud-probe", rcloneRoot)
+	tmp, err := os.CreateTemp("", "pcloud-probe-*.tmp")
+	if err != nil {
+		logf("PROBE: could not create a probe file: %v", err)
+		return
+	}
+	defer os.Remove(tmp.Name())
+	defer tmp.Close()
+	payload := []byte("restic-pcloud-server startup probe\n")
+	if _, err := tmp.Write(payload); err != nil {
+		logf("PROBE: could not write the probe file: %v", err)
+		return
+	}
+	tmp.Close()
+	out, err := runRclone("copyto", tmp.Name(), probePath)
+	if err != nil {
+		logf("PROBE: upload to %s failed: %v: %s - verified writes are NOT confirmed; saves will fail until the remote works", rcloneRoot, err, out)
+		return
+	}
+	defer runRclone("deletefile", probePath) // best-effort cleanup, whatever the verdict
+	localHashes, err := hashFile(tmp.Name())
+	if err != nil {
+		logf("PROBE: could not hash the probe file: %v", err)
+		return
+	}
+	meta, found := remoteMetaWithRetry(probePath)
+	if !found {
+		logf("PROBE: the uploaded probe object is not visible on the remote - verified writes are NOT confirmed")
+		return
+	}
+	supported := make([]string, 0, len(meta.hashes))
+	for k := range meta.hashes {
+		supported = append(supported, k)
+	}
+	sort.Strings(supported)
+	algo, failReason := verifySaved(probePath, int64(len(payload)), localHashes)
+	if failReason != "" {
+		if requireHash {
+			logf("PROBE: verification failed: %s (remote reports hashes: %s) - with -require-hash=true every save will fail until this is fixed", failReason, strings.Join(supported, ", "))
+		} else {
+			logf("PROBE: verification failed: %s (remote reports hashes: %s) - saves will fall back to size-only checks", failReason, strings.Join(supported, ", "))
+		}
+		return
+	}
+	if algo == "size-only" {
+		logf("PROBE: write OK but verified by size only - the remote reported no content hash for the probe object")
+		return
+	}
+	logf("PROBE: verified write OK (%d bytes, verified by %s); remote reports hashes: %s", len(payload), algo, strings.Join(supported, ", "))
+}
+
 func main() {
 	flag.Parse()
 	if showVersion {
@@ -575,5 +638,6 @@ func main() {
 	}
 	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
 	log.Printf("restic-pcloud-server %s%s%s listening on %s, remote root %s (max-retries=%d, debug=%v, require-hash=%v)", colorCyan, version, colorReset, listenAddr, rcloneRoot, maxRetries, debug, requireHash)
+	startupProbe()
 	log.Fatal(http.ListenAndServe(listenAddr, loggingMiddleware(authMiddleware(handler))))
 }
