@@ -32,11 +32,12 @@ restic  --(restic REST protocol, HTTP/S)-->  restic-pcloud-server  --(rclone)-->
 ```
 
 Every write from restic goes through this server, which writes it via `rclone`, then
-independently re-reads pCloud's own listing to confirm the byte count actually matches what
-was sent - and if it doesn't, deletes the bad object and retries the write from scratch, up
-to a configurable number of times, before ever telling restic the write succeeded. restic
-only ever sees a clean success or a clean failure for each object; the retrying against
-pCloud's flakiness is entirely this server's job, invisible to restic.
+independently re-reads pCloud's own listing to confirm both the byte count and the content
+hash (which pCloud reports in its file metadata) actually match what was sent - and if
+either doesn't, deletes the bad object and retries the write from scratch, up to a
+configurable number of times, before ever telling restic the write succeeded. restic only
+ever sees a clean success or a clean failure for each object; the retrying against pCloud's
+flakiness is entirely this server's job, invisible to restic.
 
 Concretely: you run this server once (as a Docker container, e.g. on a home server or NAS),
 point it at an rclone config with your pCloud remote authenticated, and then point restic's
@@ -110,8 +111,9 @@ restic check --read-data
 
 `restic check --read-data` is the important one - it's the only way to actually confirm nothing
 came back corrupted, not just that the backup command exited 0. Run it periodically even after
-initial setup; the per-write verify this server does catches wrong-size objects, but not, say,
-a same-size object with flipped bytes.
+initial setup; the per-write verify this server does catches wrong-size and content-mismatched
+objects at write time, but nothing at write time can catch corruption that happens later, at
+rest, which is what the periodic check is for.
 
 ## 3. Troubleshooting
 
@@ -130,6 +132,7 @@ docker compose logs restic-pcloud-server > server-debug.log
 | `-rclone-config` | (required) | path to `rclone.conf` |
 | `-ca-cert` | (unset) | CA bundle for rclone's TLS verification, only needed in unusual environments |
 | `-max-retries` | `3` | fresh re-upload retries after a failed verify (so the initial write plus this many retries is the total number of tries) |
+| `-require-hash` | `true` | fail verification when pCloud reports no content hash for a saved object, leaving size as the only check; pCloud reports at least one of sha256/sha1/md5 in both regions, so turn this off only for a remote that cannot report hashes at all |
 | `-listen` | `127.0.0.1:8080` | address to listen on |
 | `-debug` | `false` | log per-request/per-stage timing and concurrency, not just errors |
 | `-auth-user` / `-auth-pass` | (unset) | HTTP Basic Auth; set both to require it (or `RESTIC_PCLOUD_AUTH_USER`/`RESTIC_PCLOUD_AUTH_PASS` env vars) |

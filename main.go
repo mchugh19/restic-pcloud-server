@@ -1,6 +1,7 @@
 // restic-pcloud-server: a restic REST-protocol server backed by pCloud via rclone,
 // with verify-after-write: every Save is independently re-checked against what pCloud
-// actually stored, and retried fresh (delete + re-upload) on mismatch, instead of trusting
+// actually stored (both its size and its content hash, which pCloud reports in its file
+// metadata), and retried fresh (delete + re-upload) on mismatch, instead of trusting
 // rclone/pCloud's own "success" response. This exists because pCloud has been observed
 // reporting a successful upload for objects that come back wrong-sized or missing
 // entirely on read-back - restic's own retry logic assumes a clean pass/fail from the
@@ -8,7 +9,11 @@
 package main
 
 import (
+	"crypto/md5"
+	"crypto/sha1"
+	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -19,6 +24,7 @@ import (
 	"os/exec"
 	"regexp"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 )
@@ -32,6 +38,7 @@ var (
 	rcloneConfig string
 	caCertPath   string
 	maxRetries   int
+	requireHash  bool
 	listenAddr   string
 	debug        bool
 	authUser     string
@@ -47,6 +54,7 @@ func init() {
 	flag.StringVar(&rcloneConfig, "rclone-config", "", "path to rclone.conf")
 	flag.StringVar(&caCertPath, "ca-cert", "", "CA bundle for rclone's TLS verification (only needed when the platform's own verifier is blocked, e.g. macOS sandbox testing: /etc/ssl/cert.pem; leave unset on a normal Linux host)")
 	flag.IntVar(&maxRetries, "max-retries", 3, "max fresh re-upload retries after a failed verify (so the initial write plus this many retries is the total number of tries)")
+	flag.BoolVar(&requireHash, "require-hash", true, "fail verification when pCloud reports no content hash for a saved object, so size is the only thing that can be checked (pCloud reports at least one of sha256/sha1/md5 in both regions, so this should not happen; turn off only for a remote that cannot report hashes at all)")
 	flag.StringVar(&listenAddr, "listen", "127.0.0.1:8080", "address to listen on")
 	flag.BoolVar(&debug, "debug", false, "log per-request/per-stage timing and concurrency, not just errors")
 	flag.StringVar(&authUser, "auth-user", os.Getenv("RESTIC_PCLOUD_AUTH_USER"), "if set together with -auth-pass, require HTTP Basic Auth (defaults from RESTIC_PCLOUD_AUTH_USER env var) - required once this server is reachable from anywhere other than localhost, restic has no protocol-level auth of its own")
@@ -118,10 +126,11 @@ func remoteDir(repo, kind string) string {
 }
 
 type lsjsonEntry struct {
-	Path  string `json:"Path"`
-	Name  string `json:"Name"`
-	Size  int64  `json:"Size"`
-	IsDir bool   `json:"IsDir"`
+	Path   string            `json:"Path"`
+	Name   string            `json:"Name"`
+	Size   int64             `json:"Size"`
+	IsDir  bool              `json:"IsDir"`
+	Hashes map[string]string `json:"Hashes"` // only present with `lsjson --hash`; keys are rclone's hash names ("sha256", "sha1", "md5", ...), values lowercase hex
 }
 
 // remoteSizeOnce returns the size of a single object, or -1 if it doesn't exist - a single
@@ -162,6 +171,104 @@ func remoteSize(path string) int64 {
 		}
 	}
 	return -1
+}
+
+// remoteMeta is what one `lsjson --hash` on a single object reports: its size and the
+// content hashes the backend computed for it. pCloud reports sha256 (and sha1) in the EU
+// region and sha1 (and md5) in the US region, so at least one hash restic's objects can be
+// checked against is always expected on this backend.
+type remoteMeta struct {
+	size   int64
+	hashes map[string]string
+}
+
+// remoteMetaOnce is a single attempt at fetching an object's metadata, mirroring
+// remoteSizeOnce: ok=false means the object doesn't exist or the call itself failed.
+func remoteMetaOnce(path string) (remoteMeta, bool) {
+	out, err := runRclone("lsjson", "--hash", path)
+	if err != nil {
+		return remoteMeta{}, false
+	}
+	var entries []lsjsonEntry
+	if err := json.Unmarshal(out, &entries); err != nil || len(entries) == 0 {
+		return remoteMeta{}, false
+	}
+	return remoteMeta{size: entries[0].Size, hashes: entries[0].Hashes}, true
+}
+
+// remoteMetaWithRetry is remoteMetaOnce with the same retry-on-not-found behavior as
+// remoteSize, for the same reason: pCloud's eventual consistency can hide a just-written
+// object from one stat call and show it on the next.
+func remoteMetaWithRetry(path string) (remoteMeta, bool) {
+	const attempts = 4
+	const delay = 800 * time.Millisecond
+	for attempt := 1; attempt <= attempts; attempt++ {
+		if meta, ok := remoteMetaOnce(path); ok {
+			if attempt > 1 {
+				debugf("STAT %s: metadata found on attempt %d/%d after earlier not-found", path, attempt, attempts)
+			}
+			return meta, true
+		}
+		if attempt < attempts {
+			time.Sleep(delay)
+		}
+	}
+	return remoteMeta{}, false
+}
+
+// hashFile computes the sha256, sha1 and md5 of a local file in one pass, keyed by
+// rclone's hash names so the results compare directly against an lsjson Hashes map.
+// Hashing a pack-sized temp file costs milliseconds; it is what lets verification check
+// the actual bytes pCloud stored instead of only their count, without downloading the
+// object back - pCloud reports its own hashes in the listing metadata.
+func hashFile(path string) (map[string]string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	h256 := sha256.New()
+	h1 := sha1.New()
+	hm := md5.New()
+	if _, err := io.Copy(io.MultiWriter(h256, h1, hm), f); err != nil {
+		return nil, err
+	}
+	return map[string]string{
+		"sha256": hex.EncodeToString(h256.Sum(nil)),
+		"sha1":   hex.EncodeToString(h1.Sum(nil)),
+		"md5":    hex.EncodeToString(hm.Sum(nil)),
+	}, nil
+}
+
+// verifySaved checks what pCloud stored for one just-written object against what was
+// sent: the size must match, and the strongest content hash both sides have (sha256 in
+// the EU region, sha1 or md5 in the US) must match too. Exactly one of the two results
+// is non-empty: the algorithm the object verified by ("size-only" when no comparable
+// hash existed and -require-hash is off), or the reason verification failed.
+func verifySaved(path string, written int64, localHashes map[string]string) (string, string) {
+	meta, found := remoteMetaWithRetry(path)
+	if !found {
+		// Same wording as the size-only version used: after the metadata call's own
+		// internal retries the object still isn't visible (or the call itself failed).
+		return "", fmt.Sprintf("wrote %d bytes but pCloud still shows it missing", written)
+	}
+	if meta.size != written {
+		return "", fmt.Sprintf("size mismatch: wrote %d bytes, pCloud has %d", written, meta.size)
+	}
+	for _, algo := range []string{"sha256", "sha1", "md5"} {
+		remote, okRemote := meta.hashes[algo]
+		local, okLocal := localHashes[algo]
+		if okRemote && okLocal {
+			if !strings.EqualFold(remote, local) {
+				return "", fmt.Sprintf("hash mismatch (%s): wrote %s, pCloud has %s", algo, local, remote)
+			}
+			return algo, ""
+		}
+	}
+	if requireHash {
+		return "", "pCloud reported no content hash for the object, so its bytes cannot be verified"
+	}
+	return "size-only", ""
 }
 
 // repoNameRE matches a single client-chosen repo name segment: letters, digits, dash,
@@ -350,8 +457,8 @@ func handleList(w http.ResponseWriter, r *http.Request, repo, kind string) {
 }
 
 // handleSave is the important one: write, then independently verify against what pCloud
-// actually stored, and retry fresh (delete + re-upload from the same local temp file) on
-// any mismatch, instead of trusting rclone's own reported success.
+// actually stored (size and content hash), and retry fresh (delete + re-upload from the
+// same local temp file) on any mismatch, instead of trusting rclone's own reported success.
 func handleSave(w http.ResponseWriter, r *http.Request, repo, kind, name string) {
 	reqID := atomic.AddInt64(&saveSeq, 1) // distinguishes concurrent SAVE sequences for the same path in the log
 	saveStart := time.Now()
@@ -373,6 +480,26 @@ func handleSave(w http.ResponseWriter, r *http.Request, repo, kind, name string)
 	recvDur := time.Since(recvStart)
 
 	path := remotePath(repo, kind, name)
+
+	// Hash the received bytes once, up front: every retry re-uploads this same temp
+	// file, so its hashes are the reference for every attempt's verification.
+	localHashes, err := hashFile(tmp.Name())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	// For the kinds restic names by content hash (data, index, snapshots, keys), the
+	// received bytes should hash to the name they arrived under. This is only a
+	// diagnostic - the gate in the loop below compares pCloud against the received
+	// bytes, which is the guarantee that matters - but a mismatch here means something
+	// upstream of pCloud is wrong in a way worth seeing in the log.
+	switch kind {
+	case "data", "index", "snapshots", "keys":
+		if !strings.EqualFold(localHashes["sha256"], name) {
+			logf("SAVE %s [req %05d]: WARNING received bytes hash to %s, not the requested name %s", path, reqID, localHashes["sha256"], name)
+		}
+	}
+
 	var lastErr string
 	// attempt 0 is the initial write - not a retry. attempts 1..maxRetries are the fresh
 	// re-upload retries after a failed verify, so maxRetries retries means maxRetries+1
@@ -396,25 +523,20 @@ func handleSave(w http.ResponseWriter, r *http.Request, repo, kind, name string)
 		}
 
 		verifyStart := time.Now()
-		remoteSz := remoteSize(path)
+		algo, failReason := verifySaved(path, written, localHashes)
 		verifyDur := time.Since(verifyStart).Round(time.Second)
 		debugf("SAVE %s [req %05d] %s: recv=%s copyto=%s verify=%s bytes=%d", path, reqID, label, recvDur, copyDur, verifyDur, written)
-		if remoteSz == written {
+		if failReason == "" {
+			if algo == "size-only" {
+				logf("SAVE %s [req %05d] %s: WARNING verified by size only - pCloud reported no content hash for this object", path, reqID, label)
+			}
 			if attempt > 0 {
-				logf("SAVE %s [req %05d] %s: %sverified OK%s (%d bytes, total %s)", path, reqID, label, colorGreen, colorReset, written, time.Since(saveStart).Round(time.Second))
+				logf("SAVE %s [req %05d] %s: %sverified OK%s (%d bytes, verified by %s, total %s)", path, reqID, label, colorGreen, colorReset, written, algo, time.Since(saveStart).Round(time.Second))
 			}
 			w.WriteHeader(http.StatusOK)
 			return
 		}
-
-		// -1 means pCloud's stat still shows the object missing (or the lsjson call itself
-		// failed) after remoteSize's own internal retries - a different situation from a
-		// present-but-wrong-size object, so say so explicitly rather than printing a bare -1.
-		if remoteSz < 0 {
-			lastErr = fmt.Sprintf("wrote %d bytes but pCloud still shows it missing", written)
-		} else {
-			lastErr = fmt.Sprintf("size mismatch: wrote %d bytes, pCloud has %d", written, remoteSz)
-		}
+		lastErr = failReason
 		if willRetry {
 			logf("SAVE %s [req %05d] %s: %s%s%s - retrying fresh (copyto=%s verify=%s)", path, reqID, label, colorYellow, lastErr, colorReset, copyDur, verifyDur)
 		}
@@ -452,6 +574,6 @@ func main() {
 		os.Exit(1)
 	}
 	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
-	log.Printf("restic-pcloud-server %s%s%s listening on %s, remote root %s (max-retries=%d, debug=%v)", colorCyan, version, colorReset, listenAddr, rcloneRoot, maxRetries, debug)
+	log.Printf("restic-pcloud-server %s%s%s listening on %s, remote root %s (max-retries=%d, debug=%v, require-hash=%v)", colorCyan, version, colorReset, listenAddr, rcloneRoot, maxRetries, debug, requireHash)
 	log.Fatal(http.ListenAndServe(listenAddr, loggingMiddleware(handler)))
 }
