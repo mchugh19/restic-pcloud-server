@@ -170,9 +170,23 @@ func rcCall(method string, params map[string]interface{}) (json.RawMessage, erro
 	return raw, nil
 }
 
+// rcRel returns path relative to rcloneRoot. Every RC call addresses
+// rcloneRoot itself as the fs and passes the object or directory as a
+// path relative to it, so the daemon keeps ONE backend instance (and
+// one HTTP connection pool) for the whole server. Addressing objects by
+// their parent directory instead would make the daemon build a separate
+// backend per directory, and a restic repository has hundreds of leaf
+// directories, so connections, and the DNS lookups each new connection
+// needs, would never be reused.
+func rcRel(path string) string {
+	if path == rcloneRoot {
+		return ""
+	}
+	return strings.TrimPrefix(path, rcloneRoot+"/")
+}
+
 func rcStat(path string) (*lsjsonEntry, bool) {
-	dir, name := splitRemotePath(path)
-	raw, err := rcCall("operations/stat", map[string]interface{}{"fs": dir, "remote": name})
+	raw, err := rcCall("operations/stat", map[string]interface{}{"fs": rcloneRoot, "remote": rcRel(path)})
 	if err != nil {
 		return nil, false
 	}
@@ -185,10 +199,10 @@ func rcStat(path string) (*lsjsonEntry, bool) {
 	return out.Item, true
 }
 
-func rcList(fs, remote string, recurse, showHash bool) ([]lsjsonEntry, error) {
+func rcList(dir string, recurse, showHash bool) ([]lsjsonEntry, error) {
 	raw, err := rcCall("operations/list", map[string]interface{}{
-		"fs":     fs,
-		"remote": remote,
+		"fs":     rcloneRoot,
+		"remote": rcRel(dir),
 		"opt":    map[string]interface{}{"recurse": recurse, "showHash": showHash},
 	})
 	if err != nil {
@@ -203,18 +217,20 @@ func rcList(fs, remote string, recurse, showHash bool) ([]lsjsonEntry, error) {
 	return out.List, nil
 }
 
-func rcUpload(localPath, remotePath string) error {
-	dstDir, _ := splitRemotePath(remotePath)
+// rcUpload copies a staging directory holding exactly one object, laid
+// out at the object's path relative to rcloneRoot, to the root fs. The
+// object lands at its full remote path because the copy preserves the
+// layout below the staging root.
+func rcUpload(stageDir string) error {
 	_, err := rcCall("sync/copy", map[string]interface{}{
-		"srcFs": filepath.Dir(localPath),
-		"dstFs": dstDir,
+		"srcFs": stageDir,
+		"dstFs": rcloneRoot,
 	})
 	return err
 }
 
 func rcDelete(remotePath string) error {
-	dir, name := splitRemotePath(remotePath)
-	_, err := rcCall("operations/deletefile", map[string]interface{}{"fs": dir, "remote": name})
+	_, err := rcCall("operations/deletefile", map[string]interface{}{"fs": rcloneRoot, "remote": rcRel(remotePath)})
 	return err
 }
 
@@ -222,16 +238,17 @@ func rcDelete(remotePath string) error {
 // escaping turns the square brackets into %5B/%5D, which is the form the
 // daemon's file server accepts.
 func rcServeURL(remotePath string) string {
-	dir, name := splitRemotePath(remotePath)
-	u := url.URL{Scheme: "http", Host: rcAddr, Path: "/[" + dir + "]/" + name}
+	u := url.URL{Scheme: "http", Host: rcAddr, Path: "/[" + rcloneRoot + "]/" + rcRel(remotePath)}
 	return u.String()
 }
 
-// uploadFile copies one local file to a remote path through the active
-// transport, returning output text suitable for error messages.
-func uploadFile(localPath, remotePath string) (string, error) {
+// uploadFile copies one staged file to a remote path through the active
+// transport, returning output text suitable for error messages. The rcd
+// transport copies the whole staging directory (see rcUpload); the exec
+// transport copies the file itself.
+func uploadFile(stageDir, localPath, remotePath string) (string, error) {
 	if transport == "rcd" {
-		if err := rcUpload(localPath, remotePath); err != nil {
+		if err := rcUpload(stageDir); err != nil {
 			return err.Error(), err
 		}
 		return "", nil
@@ -402,7 +419,7 @@ func remoteMetaOnce(path string) (remoteMeta, bool) {
 		// The RC API cannot stat hashes for a single object; list its parent
 		// directory with hashes shown and pick the object's own entry.
 		dir, name := splitRemotePath(path)
-		entries, err := rcList(dir, "", false, true)
+		entries, err := rcList(dir, false, true)
 		if err != nil {
 			return remoteMeta{}, false
 		}
@@ -689,7 +706,7 @@ func handleList(w http.ResponseWriter, r *http.Request, repo, kind string) {
 	// it needs a recursive lsjson; everything else (index/keys/locks/snapshots) is flat.
 	var entries []lsjsonEntry
 	if transport == "rcd" {
-		entries, _ = rcList(repoRoot(repo), kind, kind == "data", false)
+		entries, _ = rcList(remoteDir(repo, kind), kind == "data", false)
 	} else {
 		args := []string{"lsjson"}
 		if kind == "data" {
@@ -728,18 +745,22 @@ func handleSave(w http.ResponseWriter, r *http.Request, repo, kind, name string)
 	saveStart := time.Now()
 	path := remotePath(repo, kind, name)
 
-	// The received bytes are staged in their own directory under the object's
-	// final name: the rcd transport uploads by copying a directory holding
-	// exactly this one object, and the exec transport uses the same file
-	// directly, so both share this layout.
+	// The received bytes are staged in their own directory, laid out at the
+	// object's path relative to the remote root: the rcd transport uploads
+	// by copying that directory to the root fs, so the layout below the
+	// staging root has to mirror the remote layout. The exec transport uses
+	// the staged file directly and ignores the layout.
 	stageDir, err := os.MkdirTemp("", "pcloud-save-*")
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	defer os.RemoveAll(stageDir)
-	_, objName := splitRemotePath(path)
-	localPath := filepath.Join(stageDir, objName)
+	localPath := filepath.Join(stageDir, filepath.FromSlash(rcRel(path)))
+	if err := os.MkdirAll(filepath.Dir(localPath), 0o755); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 	tmp, err := os.Create(localPath)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -787,7 +808,7 @@ func handleSave(w http.ResponseWriter, r *http.Request, repo, kind, name string)
 		willRetry := attempt < maxRetries
 
 		copyStart := time.Now()
-		out, err := uploadFile(localPath, path)
+		out, err := uploadFile(stageDir, localPath, path)
 		copyDur := time.Since(copyStart).Round(time.Second)
 		if err != nil {
 			lastErr = fmt.Sprintf("upload failed: %v: %s", err, out)
@@ -861,7 +882,7 @@ func startupProbe() {
 		logf("PROBE: could not write the probe file: %v", err)
 		return
 	}
-	out, err := uploadFile(localPath, probePath)
+	out, err := uploadFile(stageDir, localPath, probePath)
 	if err != nil {
 		logf("PROBE: upload to %s failed: %v: %s - verified writes are NOT confirmed; saves will fail until the remote works", rcloneRoot, err, out)
 		return

@@ -49,7 +49,10 @@ below covers setting that up.
 By default the server drives rclone as a single long-lived daemon (`-transport=rcd`): it
 starts `rclone rcd` as a child process and talks to it over its RC API on a loopback address,
 so the per-operation costs of the original design (one rclone process per object, each paying
-config load, DNS resolution and TLS setup) are paid once. If the daemon dies, the server
+config load, DNS resolution and TLS setup) are paid once. Every RC call addresses the remote
+root itself as the filesystem, with object paths passed relative to it, so the daemon keeps
+a single backend instance and connection pool for the whole server rather than one backend
+per repository directory. If the daemon dies, the server
 exits with it, so a supervisor restarts the pair together. The RC API is unauthenticated, so
 its address is loopback-only and never published. `-transport=exec` restores the original
 one-process-per-operation behaviour as a fallback.
