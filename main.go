@@ -575,5 +575,5 @@ func main() {
 	}
 	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
 	log.Printf("restic-pcloud-server %s%s%s listening on %s, remote root %s (max-retries=%d, debug=%v, require-hash=%v)", colorCyan, version, colorReset, listenAddr, rcloneRoot, maxRetries, debug, requireHash)
-	log.Fatal(http.ListenAndServe(listenAddr, loggingMiddleware(handler)))
+	log.Fatal(http.ListenAndServe(listenAddr, loggingMiddleware(authMiddleware(handler))))
 }
