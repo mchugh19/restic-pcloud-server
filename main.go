@@ -62,7 +62,7 @@ var (
 func init() {
 	flag.StringVar(&rcloneRoot, "remote-root", "pcloud:Backups/restic", "fixed rclone remote:path root; each restic repo is a subfolder under this, chosen by the client via its repo URL (rest:http://host:port/<repo-name>/)")
 	flag.StringVar(&rcloneConfig, "rclone-config", "", "path to rclone.conf")
-	flag.StringVar(&transport, "transport", "exec", "how to drive rclone: \"exec\" spawns one rclone process per operation; \"rcd\" starts a single long-lived rclone daemon (rcd) at startup and talks to it over its loopback RC API, so DNS, TLS and config setup are paid once instead of per object")
+	flag.StringVar(&transport, "transport", "rcd", "how to drive rclone: \"rcd\" starts a single long-lived rclone daemon at startup and talks to it over its loopback RC API, so DNS, TLS and config setup are paid once instead of per object; \"exec\" spawns one rclone process per operation (the original behaviour, kept as a fallback)")
 	flag.StringVar(&rcAddr, "rc-addr", "127.0.0.1:5572", "listen address for the rclone daemon when -transport=rcd (loopback only: the RC API is unauthenticated)")
 	flag.StringVar(&caCertPath, "ca-cert", "", "CA bundle for rclone's TLS verification (only needed when the platform's own verifier is blocked, e.g. macOS sandbox testing: /etc/ssl/cert.pem; leave unset on a normal Linux host)")
 	flag.IntVar(&maxRetries, "max-retries", 3, "max fresh re-upload retries after a failed verify (so the initial write plus this many retries is the total number of tries)")
