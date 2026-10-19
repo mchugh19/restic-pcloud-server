@@ -9,6 +9,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/md5"
 	"crypto/sha1"
 	"crypto/sha256"
@@ -20,13 +21,17 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
+	"os/signal"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -38,6 +43,10 @@ var (
 	rcloneRoot   string // fixed rclone remote:path root, e.g. "pcloud:Backups/restic" - each restic repo gets its own subfolder under this, named by the URL path segment the client requests
 	rcloneConfig string
 	caCertPath   string
+	transport    string // "exec": spawn an rclone process per operation; "rcd": keep one rclone daemon alive and drive it over its RC API
+	rcAddr       string // listen address of the rclone daemon when -transport=rcd; loopback only, it is unauthenticated by design
+	rcClient     *http.Client
+	rcdDone      chan error // receives the daemon's exit result once it dies
 	maxRetries   int
 	requireHash  bool
 	listenAddr   string
@@ -53,6 +62,8 @@ var (
 func init() {
 	flag.StringVar(&rcloneRoot, "remote-root", "pcloud:Backups/restic", "fixed rclone remote:path root; each restic repo is a subfolder under this, chosen by the client via its repo URL (rest:http://host:port/<repo-name>/)")
 	flag.StringVar(&rcloneConfig, "rclone-config", "", "path to rclone.conf")
+	flag.StringVar(&transport, "transport", "rcd", "how to drive rclone: \"rcd\" starts a single long-lived rclone daemon at startup and talks to it over its loopback RC API, so DNS, TLS and config setup are paid once instead of per object; \"exec\" spawns one rclone process per operation (the original behaviour, kept as a fallback)")
+	flag.StringVar(&rcAddr, "rc-addr", "127.0.0.1:5572", "listen address for the rclone daemon when -transport=rcd (loopback only: the RC API is unauthenticated)")
 	flag.StringVar(&caCertPath, "ca-cert", "", "CA bundle for rclone's TLS verification (only needed when the platform's own verifier is blocked, e.g. macOS sandbox testing: /etc/ssl/cert.pem; leave unset on a normal Linux host)")
 	flag.IntVar(&maxRetries, "max-retries", 3, "max fresh re-upload retries after a failed verify (so the initial write plus this many retries is the total number of tries)")
 	flag.BoolVar(&requireHash, "require-hash", true, "fail verification when pCloud reports no content hash for a saved object, so size is the only thing that can be checked (pCloud reports at least one of sha256/sha1/md5 in both regions, so this should not happen; turn off only for a remote that cannot report hashes at all)")
@@ -101,6 +112,200 @@ func runRclone(args ...string) ([]byte, error) {
 	return out, err
 }
 
+// --- rclone daemon (rcd) transport ---
+//
+// With -transport=rcd the server keeps one rclone daemon alive and drives it
+// over its RC API instead of spawning an rclone process per operation, so the
+// per-process costs (config load, DNS resolution, TLS setup, token check)
+// are paid once. The RC contracts used here were verified against rclone
+// 1.60 (the contracts are stable across current releases):
+//   - operations/stat returns {"item": {...}}, with item null (HTTP 200) for
+//     a missing object.
+//   - operations/list only includes content hashes when opt.showHash is set,
+//     and it errors on a file path, so single-object metadata is fetched by
+//     listing the object's parent directory and picking its entry.
+//   - uploads are an RC sync/copy whose source is a staging directory that
+//     holds exactly the one object under its final name (there is no
+//     single-file copy endpoint in the RC API).
+//   - downloads use the daemon's --rc-serve file endpoint, which streams and
+//     honours Range itself.
+
+var rcdCmd *exec.Cmd
+
+// splitRemotePath splits an rclone path ("remote:dir/sub/name") into the
+// directory part (itself a valid rclone fs string) and the final name, which
+// is the shape the RC API's fs+remote parameters take.
+func splitRemotePath(path string) (dir, name string) {
+	i := strings.LastIndex(path, "/")
+	if i < 0 {
+		return path, ""
+	}
+	return path[:i], path[i+1:]
+}
+
+// rcCall performs one RC API call and returns the raw response body. An RC
+// error (a non-200 status, or an "error" field in the body) becomes a Go
+// error carrying rclone's own message.
+func rcCall(method string, params map[string]interface{}) (json.RawMessage, error) {
+	body, err := json.Marshal(params)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := rcClient.Post("http://"+rcAddr+"/"+method, "application/json", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	var rcErr struct {
+		Error string `json:"error"`
+	}
+	_ = json.Unmarshal(raw, &rcErr)
+	if resp.StatusCode != http.StatusOK || rcErr.Error != "" {
+		return nil, fmt.Errorf("rc %s: %s (status %d)", method, rcErr.Error, resp.StatusCode)
+	}
+	return raw, nil
+}
+
+func rcStat(path string) (*lsjsonEntry, bool) {
+	dir, name := splitRemotePath(path)
+	raw, err := rcCall("operations/stat", map[string]interface{}{"fs": dir, "remote": name})
+	if err != nil {
+		return nil, false
+	}
+	var out struct {
+		Item *lsjsonEntry `json:"item"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil || out.Item == nil {
+		return nil, false
+	}
+	return out.Item, true
+}
+
+func rcList(fs, remote string, recurse, showHash bool) ([]lsjsonEntry, error) {
+	raw, err := rcCall("operations/list", map[string]interface{}{
+		"fs":     fs,
+		"remote": remote,
+		"opt":    map[string]interface{}{"recurse": recurse, "showHash": showHash},
+	})
+	if err != nil {
+		return nil, err
+	}
+	var out struct {
+		List []lsjsonEntry `json:"list"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil, err
+	}
+	return out.List, nil
+}
+
+func rcUpload(localPath, remotePath string) error {
+	dstDir, _ := splitRemotePath(remotePath)
+	_, err := rcCall("sync/copy", map[string]interface{}{
+		"srcFs": filepath.Dir(localPath),
+		"dstFs": dstDir,
+	})
+	return err
+}
+
+func rcDelete(remotePath string) error {
+	dir, name := splitRemotePath(remotePath)
+	_, err := rcCall("operations/deletefile", map[string]interface{}{"fs": dir, "remote": name})
+	return err
+}
+
+// rcServeURL returns the daemon's --rc-serve URL for one object. Go's URL
+// escaping turns the square brackets into %5B/%5D, which is the form the
+// daemon's file server accepts.
+func rcServeURL(remotePath string) string {
+	dir, name := splitRemotePath(remotePath)
+	u := url.URL{Scheme: "http", Host: rcAddr, Path: "/[" + dir + "]/" + name}
+	return u.String()
+}
+
+// uploadFile copies one local file to a remote path through the active
+// transport, returning output text suitable for error messages.
+func uploadFile(localPath, remotePath string) (string, error) {
+	if transport == "rcd" {
+		if err := rcUpload(localPath, remotePath); err != nil {
+			return err.Error(), err
+		}
+		return "", nil
+	}
+	out, err := runRclone("copyto", localPath, remotePath)
+	return string(out), err
+}
+
+// deleteRemote removes one remote object through the active transport.
+func deleteRemote(remotePath string) error {
+	if transport == "rcd" {
+		return rcDelete(remotePath)
+	}
+	_, err := runRclone("deletefile", remotePath)
+	return err
+}
+
+// startRCD launches the rclone daemon as a child process, waits until its RC
+// API answers, and arms supervision: if the daemon later dies, this process
+// exits too, so the service supervisor restarts the pair together rather
+// than leaving a server whose every operation would fail.
+func startRCD() error {
+	bin, err := exec.LookPath("rclone")
+	if err != nil {
+		return fmt.Errorf("rclone not found in PATH: %v", err)
+	}
+	args := append([]string{"rcd", "--rc-addr", rcAddr, "--rc-no-auth", "--rc-serve"}, rcloneBaseArgs()...)
+	rcdCmd = exec.Command(bin, args...)
+	rcdCmd.Stdout = os.Stderr // the daemon's logs interleave with this server's own log
+	rcdCmd.Stderr = os.Stderr
+	if err := rcdCmd.Start(); err != nil {
+		return fmt.Errorf("starting rclone daemon: %v", err)
+	}
+	rcdDone = make(chan error, 1)
+	go func() { rcdDone <- rcdCmd.Wait() }()
+
+	probeClient := &http.Client{Timeout: 2 * time.Second}
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		select {
+		case err := <-rcdDone:
+			return fmt.Errorf("rclone daemon exited during startup: %v", err)
+		default:
+		}
+		resp, err := probeClient.Post("http://"+rcAddr+"/core/version", "application/json", bytes.NewReader([]byte("{}")))
+		if err == nil {
+			resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				break
+			}
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("rclone daemon did not answer on %s within 30s", rcAddr)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	go func() {
+		err := <-rcdDone
+		log.Fatalf("rclone daemon exited: %v - exiting so the supervisor restarts both", err)
+	}()
+	// Clean up the daemon on SIGINT/SIGTERM instead of orphaning it (mostly
+	// for local runs; a container stop takes the whole cgroup anyway).
+	sigc := make(chan os.Signal, 1)
+	signal.Notify(sigc, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sigc
+		if rcdCmd.Process != nil {
+			rcdCmd.Process.Kill()
+		}
+		os.Exit(0)
+	}()
+	return nil
+}
+
 // repoRoot returns the rclone path for one restic repo: the fixed server-side root plus the
 // client-chosen repo name. repo is already validated by pathRE/repoCreateRE's charset
 // ([a-zA-Z0-9_-] only, no dots or slashes) before this is called, so there's no path-traversal
@@ -138,6 +343,12 @@ type lsjsonEntry struct {
 // remoteSizeOnce returns the size of a single object, or -1 if it doesn't exist - a single
 // attempt, no retry.
 func remoteSizeOnce(path string) int64 {
+	if transport == "rcd" {
+		if item, ok := rcStat(path); ok {
+			return item.Size
+		}
+		return -1
+	}
 	out, err := runRclone("lsjson", path)
 	if err != nil {
 		return -1
@@ -187,6 +398,21 @@ type remoteMeta struct {
 // remoteMetaOnce is a single attempt at fetching an object's metadata, mirroring
 // remoteSizeOnce: ok=false means the object doesn't exist or the call itself failed.
 func remoteMetaOnce(path string) (remoteMeta, bool) {
+	if transport == "rcd" {
+		// The RC API cannot stat hashes for a single object; list its parent
+		// directory with hashes shown and pick the object's own entry.
+		dir, name := splitRemotePath(path)
+		entries, err := rcList(dir, "", false, true)
+		if err != nil {
+			return remoteMeta{}, false
+		}
+		for _, e := range entries {
+			if e.Name == name && !e.IsDir {
+				return remoteMeta{size: e.Size, hashes: e.Hashes}, true
+			}
+		}
+		return remoteMeta{}, false
+	}
 	out, err := runRclone("lsjson", "--hash", path)
 	if err != nil {
 		return remoteMeta{}, false
@@ -393,6 +619,38 @@ func handleGet(w http.ResponseWriter, r *http.Request, repo, kind, name string) 
 		return
 	}
 
+	if transport == "rcd" {
+		// The daemon's file endpoint streams the object and computes Range
+		// responses itself; forward the client's Range header verbatim and
+		// relay its status and length headers.
+		req, err := http.NewRequest(http.MethodGet, rcServeURL(path), nil)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if rng := r.Header.Get("Range"); rng != "" {
+			req.Header.Set("Range", rng)
+		}
+		resp, err := rcClient.Do(req)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode == http.StatusNotFound {
+			http.NotFound(w, r)
+			return
+		}
+		for _, h := range []string{"Content-Length", "Content-Range", "Content-Type"} {
+			if v := resp.Header.Get(h); v != "" {
+				w.Header().Set(h, v)
+			}
+		}
+		w.WriteHeader(resp.StatusCode)
+		io.Copy(w, resp.Body)
+		return
+	}
+
 	args := []string{"cat", path}
 	status := http.StatusOK
 	if rng := r.Header.Get("Range"); rng != "" {
@@ -429,15 +687,19 @@ func handleGet(w http.ResponseWriter, r *http.Request, repo, kind, name string) 
 func handleList(w http.ResponseWriter, r *http.Request, repo, kind string) {
 	// "data" objects live one level down, under 2-hex-char prefix subfolders, so listing
 	// it needs a recursive lsjson; everything else (index/keys/locks/snapshots) is flat.
-	args := []string{"lsjson"}
-	if kind == "data" {
-		args = append(args, "-R")
-	}
-	args = append(args, remoteDir(repo, kind))
-	out, err := runRclone(args...)
 	var entries []lsjsonEntry
-	if err == nil {
-		json.Unmarshal(out, &entries)
+	if transport == "rcd" {
+		entries, _ = rcList(repoRoot(repo), kind, kind == "data", false)
+	} else {
+		args := []string{"lsjson"}
+		if kind == "data" {
+			args = append(args, "-R")
+		}
+		args = append(args, remoteDir(repo, kind))
+		out, err := runRclone(args...)
+		if err == nil {
+			json.Unmarshal(out, &entries)
+		}
 	}
 	// restic REST v2 listing format
 	type v2entry struct {
@@ -464,12 +726,25 @@ func handleList(w http.ResponseWriter, r *http.Request, repo, kind string) {
 func handleSave(w http.ResponseWriter, r *http.Request, repo, kind, name string) {
 	reqID := atomic.AddInt64(&saveSeq, 1) // distinguishes concurrent SAVE sequences for the same path in the log
 	saveStart := time.Now()
-	tmp, err := os.CreateTemp("", "pcloud-repair-*.tmp")
+	path := remotePath(repo, kind, name)
+
+	// The received bytes are staged in their own directory under the object's
+	// final name: the rcd transport uploads by copying a directory holding
+	// exactly this one object, and the exec transport uses the same file
+	// directly, so both share this layout.
+	stageDir, err := os.MkdirTemp("", "pcloud-save-*")
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	defer os.Remove(tmp.Name())
+	defer os.RemoveAll(stageDir)
+	_, objName := splitRemotePath(path)
+	localPath := filepath.Join(stageDir, objName)
+	tmp, err := os.Create(localPath)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 	defer tmp.Close()
 
 	recvStart := time.Now()
@@ -481,11 +756,9 @@ func handleSave(w http.ResponseWriter, r *http.Request, repo, kind, name string)
 	tmp.Close()
 	recvDur := time.Since(recvStart)
 
-	path := remotePath(repo, kind, name)
-
-	// Hash the received bytes once, up front: every retry re-uploads this same temp
-	// file, so its hashes are the reference for every attempt's verification.
-	localHashes, err := hashFile(tmp.Name())
+	// Hash the received bytes once, up front: every retry re-uploads this same
+	// staged file, so its hashes are the reference for every attempt's verification.
+	localHashes, err := hashFile(localPath)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -514,12 +787,12 @@ func handleSave(w http.ResponseWriter, r *http.Request, repo, kind, name string)
 		willRetry := attempt < maxRetries
 
 		copyStart := time.Now()
-		out, err := runRclone("copyto", tmp.Name(), path)
+		out, err := uploadFile(localPath, path)
 		copyDur := time.Since(copyStart).Round(time.Second)
 		if err != nil {
-			lastErr = fmt.Sprintf("copyto failed: %v: %s", err, out)
+			lastErr = fmt.Sprintf("upload failed: %v: %s", err, out)
 			if willRetry {
-				logf("SAVE %s [req %05d] %s: %s%s%s - retrying (copyto=%s)", path, reqID, label, colorRed, lastErr, colorReset, copyDur)
+				logf("SAVE %s [req %05d] %s: %s%s%s - retrying (upload=%s)", path, reqID, label, colorRed, lastErr, colorReset, copyDur)
 			}
 			continue
 		}
@@ -540,13 +813,13 @@ func handleSave(w http.ResponseWriter, r *http.Request, repo, kind, name string)
 		}
 		lastErr = failReason
 		if willRetry {
-			logf("SAVE %s [req %05d] %s: %s%s%s - retrying fresh (copyto=%s verify=%s)", path, reqID, label, colorYellow, lastErr, colorReset, copyDur, verifyDur)
+			logf("SAVE %s [req %05d] %s: %s%s%s - retrying fresh (upload=%s verify=%s)", path, reqID, label, colorYellow, lastErr, colorReset, copyDur, verifyDur)
 		}
 		// Always clean up the bad object, even when giving up for good - restic never got a
 		// success response for it, so it won't reference it in any index/snapshot, and leaving
 		// a wrong-size/corrupt object under its content-hash path is just orphaned garbage that
 		// restic's own metadata-only check won't flag as corruption.
-		runRclone("deletefile", path) // best-effort cleanup; ignore error (may not exist)
+		deleteRemote(path) // best-effort cleanup; ignore error (may not exist)
 		if willRetry {
 			time.Sleep(time.Duration(attempt+1) * 500 * time.Millisecond)
 		}
@@ -558,7 +831,7 @@ func handleSave(w http.ResponseWriter, r *http.Request, repo, kind, name string)
 
 func handleDelete(w http.ResponseWriter, repo, kind, name string) {
 	path := remotePath(repo, kind, name)
-	if _, err := runRclone("deletefile", path); err != nil {
+	if err := deleteRemote(path); err != nil {
 		http.NotFound(w, nil)
 		return
 	}
@@ -570,32 +843,31 @@ func handleDelete(w http.ResponseWriter, repo, kind, name string) {
 // startup and logs the outcome, so the log states up front which content hash
 // verification will use (pCloud reports sha256 in the EU region, sha1 or md5
 // in the US) and whether verified writes work at all. It reuses the same
-// copyto + verify path as a real save. It never fails startup: a remote that
+// upload + verify path as a real save. It never fails startup: a remote that
 // is briefly unreachable at boot must not crash-loop the service, and restic
 // surfaces real errors at backup time regardless. The probe object is deleted
 // again immediately.
 func startupProbe() {
 	probePath := fmt.Sprintf("%s/.restic-pcloud-probe", rcloneRoot)
-	tmp, err := os.CreateTemp("", "pcloud-probe-*.tmp")
+	stageDir, err := os.MkdirTemp("", "pcloud-probe-*")
 	if err != nil {
-		logf("PROBE: could not create a probe file: %v", err)
+		logf("PROBE: could not create a probe staging dir: %v", err)
 		return
 	}
-	defer os.Remove(tmp.Name())
-	defer tmp.Close()
+	defer os.RemoveAll(stageDir)
+	localPath := filepath.Join(stageDir, ".restic-pcloud-probe")
 	payload := []byte("restic-pcloud-server startup probe\n")
-	if _, err := tmp.Write(payload); err != nil {
+	if err := os.WriteFile(localPath, payload, 0o600); err != nil {
 		logf("PROBE: could not write the probe file: %v", err)
 		return
 	}
-	tmp.Close()
-	out, err := runRclone("copyto", tmp.Name(), probePath)
+	out, err := uploadFile(localPath, probePath)
 	if err != nil {
 		logf("PROBE: upload to %s failed: %v: %s - verified writes are NOT confirmed; saves will fail until the remote works", rcloneRoot, err, out)
 		return
 	}
-	defer runRclone("deletefile", probePath) // best-effort cleanup, whatever the verdict
-	localHashes, err := hashFile(tmp.Name())
+	defer deleteRemote(probePath) // best-effort cleanup, whatever the verdict
+	localHashes, err := hashFile(localPath)
 	if err != nil {
 		logf("PROBE: could not hash the probe file: %v", err)
 		return
@@ -636,8 +908,22 @@ func main() {
 		fmt.Fprintln(os.Stderr, "must pass -rclone-config")
 		os.Exit(1)
 	}
+	if transport != "exec" && transport != "rcd" {
+		fmt.Fprintf(os.Stderr, "unknown -transport %q (want \"exec\" or \"rcd\")\n", transport)
+		os.Exit(1)
+	}
+	rcClient = &http.Client{} // no overall timeout: RC operations legitimately run for minutes at repository scale
 	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
-	log.Printf("restic-pcloud-server %s%s%s listening on %s, remote root %s (max-retries=%d, debug=%v, require-hash=%v)", colorCyan, version, colorReset, listenAddr, rcloneRoot, maxRetries, debug, requireHash)
+	transportDesc := "exec (one rclone process per operation)"
+	if transport == "rcd" {
+		transportDesc = fmt.Sprintf("rcd (one rclone daemon, RC API on %s)", rcAddr)
+	}
+	log.Printf("restic-pcloud-server %s%s%s listening on %s, remote root %s (max-retries=%d, debug=%v, require-hash=%v, transport=%s)", colorCyan, version, colorReset, listenAddr, rcloneRoot, maxRetries, debug, requireHash, transportDesc)
+	if transport == "rcd" {
+		if err := startRCD(); err != nil {
+			log.Fatalf("could not start the rclone daemon transport: %v", err)
+		}
+	}
 	startupProbe()
 	log.Fatal(http.ListenAndServe(listenAddr, loggingMiddleware(authMiddleware(handler))))
 }

@@ -46,6 +46,14 @@ where this server runs (it's bundled in the container) - the machine actually ru
 `restic backup` needs nothing but restic itself and network access to this server. Everything
 below covers setting that up.
 
+By default the server drives rclone as a single long-lived daemon (`-transport=rcd`): it
+starts `rclone rcd` as a child process and talks to it over its RC API on a loopback address,
+so the per-operation costs of the original design (one rclone process per object, each paying
+config load, DNS resolution and TLS setup) are paid once. If the daemon dies, the server
+exits with it, so a supervisor restarts the pair together. The RC API is unauthenticated, so
+its address is loopback-only and never published. `-transport=exec` restores the original
+one-process-per-operation behaviour as a fallback.
+
 ## 1. Setup
 
 ```bash
@@ -143,6 +151,8 @@ docker compose logs restic-pcloud-server > server-debug.log
 |---|---|---|
 | `-remote-root` | `pcloud:Backups/restic` | fixed rclone `remote:path` root; each restic repo is a subfolder under this |
 | `-rclone-config` | (required) | path to `rclone.conf` |
+| `-transport` | `rcd` | how rclone is driven: `rcd` keeps one rclone daemon alive and uses its RC API; `exec` spawns one rclone process per operation |
+| `-rc-addr` | `127.0.0.1:5572` | listen address of the rclone daemon when `-transport=rcd` (loopback only: the RC API is unauthenticated) |
 | `-ca-cert` | (unset) | CA bundle for rclone's TLS verification, only needed in unusual environments |
 | `-max-retries` | `3` | fresh re-upload retries after a failed verify (so the initial write plus this many retries is the total number of tries) |
 | `-require-hash` | `true` | fail verification when pCloud reports no content hash for a saved object, leaving size as the only check; pCloud reports at least one of sha256/sha1/md5 in both regions, so turn this off only for a remote that cannot report hashes at all |
