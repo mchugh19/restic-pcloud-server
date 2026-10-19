@@ -73,6 +73,7 @@ func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		u, p, ok := r.BasicAuth()
 		if !ok || subtle.ConstantTimeCompare([]byte(u), []byte(authUser)) != 1 || subtle.ConstantTimeCompare([]byte(p), []byte(authPass)) != 1 {
+			logf("AUTH failed: %s %s from %s (user %q)", r.Method, r.URL.Path, r.RemoteAddr, u)
 			w.Header().Set("WWW-Authenticate", `Basic realm="restic-pcloud-server"`)
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
@@ -530,9 +531,7 @@ func handleSave(w http.ResponseWriter, r *http.Request, repo, kind, name string)
 			if algo == "size-only" {
 				logf("SAVE %s [req %05d] %s: WARNING verified by size only - pCloud reported no content hash for this object", path, reqID, label)
 			}
-			if attempt > 0 {
-				logf("SAVE %s [req %05d] %s: %sverified OK%s (%d bytes, verified by %s, total %s)", path, reqID, label, colorGreen, colorReset, written, algo, time.Since(saveStart).Round(time.Second))
-			}
+			logf("SAVE %s [req %05d] %s: %sverified OK%s (%d bytes, verified by %s, total %s)", path, reqID, label, colorGreen, colorReset, written, algo, time.Since(saveStart).Round(time.Second))
 			w.WriteHeader(http.StatusOK)
 			return
 		}
@@ -560,6 +559,7 @@ func handleDelete(w http.ResponseWriter, repo, kind, name string) {
 		http.NotFound(w, nil)
 		return
 	}
+	logf("DELETE %s", path)
 	w.WriteHeader(http.StatusOK)
 }
 
