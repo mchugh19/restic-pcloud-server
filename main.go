@@ -49,6 +49,7 @@ var (
 	rcdDone      chan error // receives the daemon's exit result once it dies
 	maxRetries   int
 	requireHash  bool
+	verifyWait   time.Duration
 	listenAddr   string
 	debug        bool
 	authUser     string
@@ -67,6 +68,7 @@ func init() {
 	flag.StringVar(&caCertPath, "ca-cert", "", "CA bundle for rclone's TLS verification (only needed when the platform's own verifier is blocked, e.g. macOS sandbox testing: /etc/ssl/cert.pem; leave unset on a normal Linux host)")
 	flag.IntVar(&maxRetries, "max-retries", 3, "max fresh re-upload retries after a failed verify (so the initial write plus this many retries is the total number of tries)")
 	flag.BoolVar(&requireHash, "require-hash", true, "fail verification when pCloud reports no content hash for a saved object, so size is the only thing that can be checked (pCloud reports at least one of sha256/sha1/md5 in both regions, so this should not happen; turn off only for a remote that cannot report hashes at all)")
+	flag.DurationVar(&verifyWait, "verify-wait", 5*time.Minute, "how long verification waits for pCloud to make a just-written object visible and report its content hash before the write is treated as failed (pCloud has been seen to hide a stored object from listings and hash reads for minutes at a time); a visible object with the wrong size or hash fails immediately, only absence waits")
 	flag.StringVar(&listenAddr, "listen", "127.0.0.1:8080", "address to listen on")
 	flag.BoolVar(&debug, "debug", false, "log per-request/per-stage timing and concurrency, not just errors")
 	flag.StringVar(&authUser, "auth-user", os.Getenv("RESTIC_PCLOUD_AUTH_USER"), "if set together with -auth-pass, require HTTP Basic Auth (defaults from RESTIC_PCLOUD_AUTH_USER env var) - required once this server is reachable from anywhere other than localhost, restic has no protocol-level auth of its own")
@@ -441,24 +443,25 @@ func remoteMetaOnce(path string) (remoteMeta, bool) {
 	return remoteMeta{size: entries[0].Size, hashes: entries[0].Hashes}, true
 }
 
-// remoteMetaWithRetry is remoteMetaOnce with the same retry-on-not-found behavior as
-// remoteSize, for the same reason: pCloud's eventual consistency can hide a just-written
-// object from one stat call and show it on the next.
-func remoteMetaWithRetry(path string) (remoteMeta, bool) {
-	const attempts = 4
-	const delay = 800 * time.Millisecond
-	for attempt := 1; attempt <= attempts; attempt++ {
+// verifyPollInterval is how often the verify path re-checks an object pCloud is
+// not showing yet.
+const verifyPollInterval = 5 * time.Second
+
+// pollMeta fetches an object's metadata, waiting for pCloud to make the object
+// visible for up to verifyWait, the same patience verifySaved applies: pCloud's
+// eventual consistency can hide a just-written object for minutes, far beyond a
+// few quick retries.
+func pollMeta(path string) (remoteMeta, bool) {
+	deadline := time.Now().Add(verifyWait)
+	for {
 		if meta, ok := remoteMetaOnce(path); ok {
-			if attempt > 1 {
-				debugf("STAT %s: metadata found on attempt %d/%d after earlier not-found", path, attempt, attempts)
-			}
 			return meta, true
 		}
-		if attempt < attempts {
-			time.Sleep(delay)
+		if time.Now().After(deadline) {
+			return remoteMeta{}, false
 		}
+		time.Sleep(verifyPollInterval)
 	}
-	return remoteMeta{}, false
 }
 
 // hashFile computes the sha256, sha1 and md5 of a local file in one pass, keyed by
@@ -490,30 +493,52 @@ func hashFile(path string) (map[string]string, error) {
 // the EU region, sha1 or md5 in the US) must match too. Exactly one of the two results
 // is non-empty: the algorithm the object verified by ("size-only" when no comparable
 // hash existed and -require-hash is off), or the reason verification failed.
+//
+// pCloud can take minutes to make a stored object verifiable: it is missing from
+// listings at first, or listed before its content hashes are reported. Both states
+// are waited out for up to verifyWait, because deleting and re-uploading only
+// restarts that clock and the object usually appears unchanged. Wrong content never
+// heals, so an object that IS visible with the wrong size, or with a hash that does
+// not match, fails at once.
 func verifySaved(path string, written int64, localHashes map[string]string) (string, string) {
-	meta, found := remoteMetaWithRetry(path)
-	if !found {
-		// Same wording as the size-only version used: after the metadata call's own
-		// internal retries the object still isn't visible (or the call itself failed).
-		return "", fmt.Sprintf("wrote %d bytes but pCloud still shows it missing", written)
-	}
-	if meta.size != written {
-		return "", fmt.Sprintf("size mismatch: wrote %d bytes, pCloud has %d", written, meta.size)
-	}
-	for _, algo := range []string{"sha256", "sha1", "md5"} {
-		remote, okRemote := meta.hashes[algo]
-		local, okLocal := localHashes[algo]
-		if okRemote && okLocal {
-			if !strings.EqualFold(remote, local) {
-				return "", fmt.Sprintf("hash mismatch (%s): wrote %s, pCloud has %s", algo, local, remote)
+	start := time.Now()
+	deadline := start.Add(verifyWait)
+	sawObject := false
+	for {
+		meta, found := remoteMetaOnce(path)
+		if found {
+			sawObject = true
+			if meta.size != written {
+				return "", fmt.Sprintf("size mismatch: wrote %d bytes, pCloud has %d", written, meta.size)
 			}
-			return algo, ""
+			for _, algo := range []string{"sha256", "sha1", "md5"} {
+				remote, okRemote := meta.hashes[algo]
+				local, okLocal := localHashes[algo]
+				if okRemote && okLocal {
+					if !strings.EqualFold(remote, local) {
+						return "", fmt.Sprintf("hash mismatch (%s): wrote %s, pCloud has %s", algo, local, remote)
+					}
+					if waited := time.Since(start); waited >= verifyPollInterval {
+						logf("VERIFY %s: pCloud made the object verifiable after %s (verified by %s)", path, waited.Round(time.Second), algo)
+					}
+					return algo, ""
+				}
+			}
+			if !requireHash {
+				return "size-only", ""
+			}
+			// Visible but no comparable hash reported yet: the lag case, waited
+			// out below like absence; the no-hash failure is returned if the
+			// deadline passes in this state.
 		}
+		if time.Now().After(deadline) {
+			if sawObject {
+				return "", "pCloud reported no content hash for the object, so its bytes cannot be verified"
+			}
+			return "", fmt.Sprintf("wrote %d bytes but pCloud still shows it missing", written)
+		}
+		time.Sleep(verifyPollInterval)
 	}
-	if requireHash {
-		return "", "pCloud reported no content hash for the object, so its bytes cannot be verified"
-	}
-	return "size-only", ""
 }
 
 // repoNameRE matches a single client-chosen repo name segment: letters, digits, dash,
@@ -893,7 +918,7 @@ func startupProbe() {
 		logf("PROBE: could not hash the probe file: %v", err)
 		return
 	}
-	meta, found := remoteMetaWithRetry(probePath)
+	meta, found := pollMeta(probePath)
 	if !found {
 		logf("PROBE: the uploaded probe object is not visible on the remote - verified writes are NOT confirmed")
 		return
