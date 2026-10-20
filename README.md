@@ -138,8 +138,8 @@ way.
 
 Routine successful saves are not logged individually - at repository scale that is one line per
 object for no signal. What is logged: any save that needed a retry (including its eventual
-verified OK), every verification mismatch or failure, successful deletes, and failed
-authentication attempts.
+verified OK), every verification mismatch or failure, any save whose verification had to wait
+for pCloud to make the object visible, successful deletes, and failed authentication attempts.
 
 Run with `-debug=true` (or `DEBUG=true` in `.env`) to log per-request timing, concurrency, and
 every verify/retry decision to stdout:
@@ -159,6 +159,7 @@ docker compose logs restic-pcloud-server > server-debug.log
 | `-ca-cert` | (unset) | CA bundle for rclone's TLS verification, only needed in unusual environments |
 | `-max-retries` | `3` | fresh re-upload retries after a failed verify (so the initial write plus this many retries is the total number of tries) |
 | `-require-hash` | `true` | fail verification when pCloud reports no content hash for a saved object, leaving size as the only check; pCloud reports at least one of sha256/sha1/md5 in both regions, so turn this off only for a remote that cannot report hashes at all |
+| `-verify-wait` | `5m` | how long verification waits for pCloud to make a just-written object visible and report its content hash before failing the write; pCloud can hide a stored object for minutes. A visible object with the wrong size or hash fails immediately, only absence waits |
 | `-listen` | `127.0.0.1:8080` | address to listen on |
 | `-debug` | `false` | log per-request/per-stage timing and concurrency, not just errors |
 | `-auth-user` / `-auth-pass` | (unset) | HTTP Basic Auth; set both to require it (or `RESTIC_PCLOUD_AUTH_USER`/`RESTIC_PCLOUD_AUTH_PASS` env vars) |
